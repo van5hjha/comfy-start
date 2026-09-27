@@ -17,13 +17,16 @@ mkdir -p "${WORKSPACE}"
 cd "${WORKSPACE}"
 
 # 1. System packages (aria2 for 10Gbps parallel downloads)
-echo "[1/6] Installing system tools (aria2)..."
-apt-get update -qq && apt-get install -y -qq aria2 curl wget git
+echo "[1/6] Installing system tools (aria2, tar, curl)..."
+apt-get update -qq && apt-get install -y -qq aria2 curl wget tar ca-certificates
+git config --global core.fileMode false 2>/dev/null || true
+git config --global --add safe.directory "*" 2>/dev/null || true
 
-# 2. Clone ComfyUI if not already present on persistent volume
-if [ ! -d "${COMFY_DIR}" ]; then
-    echo "[2/6] Cloning ComfyUI repository to ${COMFY_DIR}..."
-    git clone https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}"
+# 2. Setup ComfyUI on persistent volume (bypasses NFS chmod lock issues)
+if [ ! -f "${COMFY_DIR}/main.py" ]; then
+    echo "[2/6] Downloading ComfyUI to ${COMFY_DIR}..."
+    mkdir -p "${COMFY_DIR}"
+    curl -fsSL https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.tar.gz | tar -xz --strip-components=1 -C "${COMFY_DIR}"
 else
     echo "[2/6] ComfyUI already exists in ${COMFY_DIR} (Persistent Volume)."
 fi
@@ -34,19 +37,21 @@ cd "${COMFY_DIR}"
 echo "[3/6] Installing ComfyUI core requirements..."
 pip install -q -r requirements.txt
 
-# 4. Clone custom nodes (ComfyUI-Manager and ComfyUI-KJNodes)
+# 4. Setup custom nodes (ComfyUI-Manager and ComfyUI-KJNodes)
 echo "[4/6] Setting up custom nodes..."
 CUSTOM_NODES="${COMFY_DIR}/custom_nodes"
 mkdir -p "${CUSTOM_NODES}"
 
-if [ ! -d "${CUSTOM_NODES}/ComfyUI-Manager" ]; then
-    echo "  -> Cloning ComfyUI-Manager..."
-    git clone https://github.com/ltdrdata/ComfyUI-Manager.git "${CUSTOM_NODES}/ComfyUI-Manager"
+if [ ! -d "${CUSTOM_NODES}/ComfyUI-Manager" ] || [ ! -f "${CUSTOM_NODES}/ComfyUI-Manager/__init__.py" ]; then
+    echo "  -> Installing ComfyUI-Manager..."
+    mkdir -p "${CUSTOM_NODES}/ComfyUI-Manager"
+    curl -fsSL https://github.com/ltdrdata/ComfyUI-Manager/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C "${CUSTOM_NODES}/ComfyUI-Manager"
 fi
 
-if [ ! -d "${CUSTOM_NODES}/ComfyUI-KJNodes" ]; then
-    echo "  -> Cloning ComfyUI-KJNodes..."
-    git clone https://github.com/kijai/ComfyUI-KJNodes.git "${CUSTOM_NODES}/ComfyUI-KJNodes"
+if [ ! -d "${CUSTOM_NODES}/ComfyUI-KJNodes" ] || [ ! -f "${CUSTOM_NODES}/ComfyUI-KJNodes/__init__.py" ]; then
+    echo "  -> Installing ComfyUI-KJNodes..."
+    mkdir -p "${CUSTOM_NODES}/ComfyUI-KJNodes"
+    curl -fsSL https://github.com/kijai/ComfyUI-KJNodes/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C "${CUSTOM_NODES}/ComfyUI-KJNodes"
 fi
 
 echo "  -> Installing custom node dependencies..."
