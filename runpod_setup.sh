@@ -25,9 +25,10 @@ echo "[1/6] Installing system tools (aria2, git, curl)..."
 apt-get update -qq && apt-get install -y -qq aria2 curl wget git
 
 # 2. Setup ComfyUI on fast local container SSD (bypasses all NFS chmod/chown issues)
-if [ ! -d "${COMFY_DIR}" ]; then
+if [ ! -d "${COMFY_DIR}/.git" ]; then
     echo "[2/6] Cloning ComfyUI to local container disk (${COMFY_DIR})..."
-    git clone https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}"
+    rm -rf "${COMFY_DIR}"
+    git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}"
 else
     echo "[2/6] ComfyUI already exists in ${COMFY_DIR}."
 fi
@@ -37,20 +38,23 @@ cd "${COMFY_DIR}"
 # 3. Python environment & requirements
 echo "[3/6] Installing ComfyUI core requirements..."
 pip install -q -r requirements.txt
+pip install -q --force-reinstall --no-deps comfy-kitchen
 
 # 4. Setup custom nodes (ComfyUI-Manager and ComfyUI-KJNodes) on local SSD
 echo "[4/6] Setting up custom nodes..."
 CUSTOM_NODES="${COMFY_DIR}/custom_nodes"
 mkdir -p "${CUSTOM_NODES}"
 
-if [ ! -d "${CUSTOM_NODES}/ComfyUI-Manager" ]; then
+if [ ! -d "${CUSTOM_NODES}/ComfyUI-Manager/.git" ]; then
     echo "  -> Cloning ComfyUI-Manager..."
-    git clone https://github.com/ltdrdata/ComfyUI-Manager.git "${CUSTOM_NODES}/ComfyUI-Manager"
+    rm -rf "${CUSTOM_NODES}/ComfyUI-Manager"
+    git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git "${CUSTOM_NODES}/ComfyUI-Manager"
 fi
 
-if [ ! -d "${CUSTOM_NODES}/ComfyUI-KJNodes" ]; then
+if [ ! -d "${CUSTOM_NODES}/ComfyUI-KJNodes/.git" ]; then
     echo "  -> Cloning ComfyUI-KJNodes..."
-    git clone https://github.com/kijai/ComfyUI-KJNodes.git "${CUSTOM_NODES}/ComfyUI-KJNodes"
+    rm -rf "${CUSTOM_NODES}/ComfyUI-KJNodes"
+    git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git "${CUSTOM_NODES}/ComfyUI-KJNodes"
 fi
 
 echo "  -> Installing custom node dependencies..."
@@ -104,19 +108,19 @@ except Exception:
         except Exception as e:
             print(f"  Warning patching infer_schema: {e}")
 
-# C. Patch comfy_kitchen python files: replace list[...] with typing.List[...]
+# C. Patch ONLY comfy_kitchen custom operator files that use custom_op (e.g. conv3d.py)
 for sp in site.getsitepackages():
     for p in glob.glob(os.path.join(sp, "comfy_kitchen", "**", "*.py"), recursive=True):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 content = f.read()
-            if "list[" in content:
-                new_content = re.sub(r"\blist\[([a-zA-Z0-9_\.]+)\]", r"typing.List[\1]", content)
-                if "import typing" not in new_content and "from typing import" not in new_content:
-                    new_content = "import typing\n" + new_content
+            if "custom_op" in content and "list[" in content:
+                if "import typing\n" not in content:
+                    content = "import typing\n" + content
+                content = re.sub(r"\blist\[([a-zA-Z0-9_\.]+)\]", r"typing.List[\1]", content)
                 with open(p, "w", encoding="utf-8") as f:
-                    f.write(new_content)
-                print(f"  ✓ Patched comfy_kitchen file: {os.path.basename(p)}")
+                    f.write(content)
+                print(f"  ✓ Patched custom_op file: {os.path.basename(p)}")
         except Exception as e:
             print(f"  Warning patching comfy_kitchen: {e}")
 PYEOF
@@ -5335,11 +5339,8 @@ echo "===================================================================="
 echo " [SUCCESS] Setup Complete! Launching ComfyUI on Port 8188..."
 echo "===================================================================="
 
-# Verify ComfyUI core modules import cleanly before launching
-python -c "import comfy.quant_ops; print('  ✓ Verified ComfyUI core modules load cleanly!')" 2>&1 || {
-    echo "  [Fallback] Uninstalling comfy_kitchen to guarantee clean startup..."
-    pip uninstall -y comfy_kitchen 2>/dev/null || true
-}
+# Verify ComfyUI core modules and comfy_kitchen import cleanly before launching
+python -c "import comfy_kitchen; import comfy.quant_ops; import comfy.ldm.modules.attention; print('  ✓ Verified ComfyUI core modules and comfy_kitchen load cleanly!')"
 
 # Launch ComfyUI listening on all interfaces for RunPod HTTP proxy
 exec python main.py --listen 0.0.0.0 --port 8188 --preview-method auto
