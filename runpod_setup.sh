@@ -39,6 +39,13 @@ cd "${COMFY_DIR}"
 # 3. Python environment & requirements
 echo "[3/6] Installing ComfyUI core requirements..."
 pip install -q -r requirements.txt
+
+# Blackwell GPU (sm_120) compatibility: upgrade PyTorch to CUDA 12.8 if needed
+if python -c "import torch; exit(0 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 12 and '12.0' not in torch.cuda.get_arch_list() and 'sm_120' not in torch.cuda.get_arch_list() else 1)" 2>/dev/null; then
+    echo "  [INFO] NVIDIA Blackwell GPU detected (sm_120). Upgrading PyTorch with CUDA 12.8 for native Blackwell kernel support..."
+    pip install -q --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+fi
+
 pip install -q --force-reinstall --no-deps comfy-kitchen
 
 # 4. Setup custom nodes (ComfyUI-Manager and ComfyUI-KJNodes) on local SSD
