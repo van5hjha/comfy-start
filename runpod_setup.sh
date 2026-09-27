@@ -11,24 +11,25 @@ echo " Starting RunPod Automated Setup for Tier 2 Face Swap"
 echo "===================================================================="
 
 WORKSPACE="/workspace"
-COMFY_DIR="${WORKSPACE}/ComfyUI"
+COMFY_DIR="/root/ComfyUI"
+MODELS_DIR="${WORKSPACE}/models"
+OUTPUTS_DIR="${WORKSPACE}/output"
+WORKFLOWS_DIR="${WORKSPACE}/workflows"
 
-mkdir -p "${WORKSPACE}"
-cd "${WORKSPACE}"
+# Clean up any broken leftover ComfyUI directory on NFS volume
+rm -rf "${WORKSPACE}/ComfyUI" 2>/dev/null || true
+mkdir -p "${WORKSPACE}" "${MODELS_DIR}" "${OUTPUTS_DIR}" "${WORKFLOWS_DIR}"
 
 # 1. System packages (aria2 for 10Gbps parallel downloads)
-echo "[1/6] Installing system tools (aria2, tar, curl)..."
-apt-get update -qq && apt-get install -y -qq aria2 curl wget tar ca-certificates
-git config --global core.fileMode false 2>/dev/null || true
-git config --global --add safe.directory "*" 2>/dev/null || true
+echo "[1/6] Installing system tools (aria2, git, curl)..."
+apt-get update -qq && apt-get install -y -qq aria2 curl wget git
 
-# 2. Setup ComfyUI on persistent volume (bypasses NFS chmod lock issues)
-if [ ! -f "${COMFY_DIR}/main.py" ]; then
-    echo "[2/6] Downloading ComfyUI to ${COMFY_DIR}..."
-    mkdir -p "${COMFY_DIR}"
-    curl -fsSL https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.tar.gz | tar -xz --strip-components=1 -C "${COMFY_DIR}"
+# 2. Setup ComfyUI on fast local container SSD (bypasses all NFS chmod/chown issues)
+if [ ! -d "${COMFY_DIR}" ]; then
+    echo "[2/6] Cloning ComfyUI to local container disk (${COMFY_DIR})..."
+    git clone https://github.com/comfyanonymous/ComfyUI.git "${COMFY_DIR}"
 else
-    echo "[2/6] ComfyUI already exists in ${COMFY_DIR} (Persistent Volume)."
+    echo "[2/6] ComfyUI already exists in ${COMFY_DIR}."
 fi
 
 cd "${COMFY_DIR}"
@@ -37,28 +38,45 @@ cd "${COMFY_DIR}"
 echo "[3/6] Installing ComfyUI core requirements..."
 pip install -q -r requirements.txt
 
-# 4. Setup custom nodes (ComfyUI-Manager and ComfyUI-KJNodes)
+# 4. Setup custom nodes (ComfyUI-Manager and ComfyUI-KJNodes) on local SSD
 echo "[4/6] Setting up custom nodes..."
 CUSTOM_NODES="${COMFY_DIR}/custom_nodes"
 mkdir -p "${CUSTOM_NODES}"
 
-if [ ! -d "${CUSTOM_NODES}/ComfyUI-Manager" ] || [ ! -f "${CUSTOM_NODES}/ComfyUI-Manager/__init__.py" ]; then
-    echo "  -> Installing ComfyUI-Manager..."
-    mkdir -p "${CUSTOM_NODES}/ComfyUI-Manager"
-    curl -fsSL https://github.com/ltdrdata/ComfyUI-Manager/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C "${CUSTOM_NODES}/ComfyUI-Manager"
+if [ ! -d "${CUSTOM_NODES}/ComfyUI-Manager" ]; then
+    echo "  -> Cloning ComfyUI-Manager..."
+    git clone https://github.com/ltdrdata/ComfyUI-Manager.git "${CUSTOM_NODES}/ComfyUI-Manager"
 fi
 
-if [ ! -d "${CUSTOM_NODES}/ComfyUI-KJNodes" ] || [ ! -f "${CUSTOM_NODES}/ComfyUI-KJNodes/__init__.py" ]; then
-    echo "  -> Installing ComfyUI-KJNodes..."
-    mkdir -p "${CUSTOM_NODES}/ComfyUI-KJNodes"
-    curl -fsSL https://github.com/kijai/ComfyUI-KJNodes/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C "${CUSTOM_NODES}/ComfyUI-KJNodes"
+if [ ! -d "${CUSTOM_NODES}/ComfyUI-KJNodes" ]; then
+    echo "  -> Cloning ComfyUI-KJNodes..."
+    git clone https://github.com/kijai/ComfyUI-KJNodes.git "${CUSTOM_NODES}/ComfyUI-KJNodes"
 fi
 
 echo "  -> Installing custom node dependencies..."
 pip install -q color-matcher mss opencv-python-headless GitPython
 
-# 5. Fast Parallel Model Downloads via aria2c
-echo "[5/6] Checking & downloading required model weights (~18 GB total)..."
+# 5. Link Persistent Network Volume (/workspace) for Models, Outputs, and Workflows
+echo "[5/6] Linking persistent network volume (/workspace) to ComfyUI..."
+mkdir -p "${MODELS_DIR}/text_encoders"
+mkdir -p "${MODELS_DIR}/clip"
+mkdir -p "${MODELS_DIR}/diffusion_models"
+mkdir -p "${MODELS_DIR}/unet"
+mkdir -p "${MODELS_DIR}/vae"
+mkdir -p "${MODELS_DIR}/loras"
+
+rm -rf "${COMFY_DIR}/models"
+ln -sf "${MODELS_DIR}" "${COMFY_DIR}/models"
+
+rm -rf "${COMFY_DIR}/output"
+ln -sf "${OUTPUTS_DIR}" "${COMFY_DIR}/output"
+
+mkdir -p "${COMFY_DIR}/user/default"
+rm -rf "${COMFY_DIR}/user/default/workflows"
+ln -sf "${WORKFLOWS_DIR}" "${COMFY_DIR}/user/default/workflows"
+
+# 6. Fast Parallel Model Downloads directly to Persistent Network Volume
+echo "[6/6] Checking & downloading required model weights (~18 GB total)..."
 
 download_model() {
     local url="$1"
@@ -77,52 +95,42 @@ download_model() {
     fi
 }
 
-# Directories
-mkdir -p "${COMFY_DIR}/models/text_encoders"
-mkdir -p "${COMFY_DIR}/models/clip"
-mkdir -p "${COMFY_DIR}/models/diffusion_models"
-mkdir -p "${COMFY_DIR}/models/unet"
-mkdir -p "${COMFY_DIR}/models/vae"
-mkdir -p "${COMFY_DIR}/models/loras"
-mkdir -p "${COMFY_DIR}/user/default/workflows"
-
 # A. Qwen 3 8B Text Encoder
 download_model \
     "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" \
-    "${COMFY_DIR}/models/text_encoders" \
+    "${MODELS_DIR}/text_encoders" \
     "qwen_3_8b_fp8mixed.safetensors"
-ln -sf "${COMFY_DIR}/models/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${COMFY_DIR}/models/clip/qwen_3_8b_fp8mixed.safetensors"
+ln -sf "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors" "${MODELS_DIR}/clip/qwen_3_8b_fp8mixed.safetensors"
 
 # B. FLUX.2 Klein 9B Diffusion Model
 download_model \
     "https://huggingface.co/MIUProject/FLUX.2-klein-9b-fp8/resolve/main/flux-2-klein-9b-fp8.safetensors" \
-    "${COMFY_DIR}/models/diffusion_models" \
+    "${MODELS_DIR}/diffusion_models" \
     "flux-2-klein-9b.safetensors"
-ln -sf "${COMFY_DIR}/models/diffusion_models/flux-2-klein-9b.safetensors" "${COMFY_DIR}/models/unet/flux-2-klein-9b.safetensors"
-ln -sf "${COMFY_DIR}/models/diffusion_models/flux-2-klein-9b.safetensors" "${COMFY_DIR}/models/diffusion_models/flux-2-klein-9b-fp8.safetensors"
-ln -sf "${COMFY_DIR}/models/diffusion_models/flux-2-klein-9b.safetensors" "${COMFY_DIR}/models/unet/flux-2-klein-9b-fp8.safetensors"
+ln -sf "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors" "${MODELS_DIR}/unet/flux-2-klein-9b.safetensors"
+ln -sf "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors" "${MODELS_DIR}/diffusion_models/flux-2-klein-9b-fp8.safetensors"
+ln -sf "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors" "${MODELS_DIR}/unet/flux-2-klein-9b-fp8.safetensors"
 
 # C. FLUX 2 VAE
 download_model \
     "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors" \
-    "${COMFY_DIR}/models/vae" \
+    "${MODELS_DIR}/vae" \
     "flux2-vae.safetensors"
 
 # D. BFS Best Face Swap LoRA
 download_model \
     "https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3750_rank64.safetensors" \
-    "${COMFY_DIR}/models/loras" \
+    "${MODELS_DIR}/loras" \
     "Alissonerdx__BFS-Best-Face-Swap__bfs_head_v1_flux-klein_9b_step3750_rank64.safetensors"
 
 # E. Hyper-FLUX 8-Step LoRA
 download_model \
     "https://huggingface.co/ByteDance/Hyper-SD/resolve/main/Hyper-FLUX.1-dev-8steps-lora.safetensors" \
-    "${COMFY_DIR}/models/loras" \
+    "${MODELS_DIR}/loras" \
     "Hyper-FLUX.1-dev-8steps-lora.safetensors"
 
-# 6. Deploy Morphology-Accurate Workflow JSON directly into ComfyUI
-echo "[6/6] Deploying face_swap_3ref_masked_workflow.json into ComfyUI workflows..."
-cat << 'EOF' > "${COMFY_DIR}/user/default/workflows/face_swap_3ref_masked_workflow.json"
+# Deploy Morphology-Accurate Workflow JSON directly into persistent workflows directory
+cat << 'EOF' > "${WORKFLOWS_DIR}/face_swap_3ref_masked_workflow.json"
 {
   "config": {},
   "definitions": {
