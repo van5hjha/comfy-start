@@ -5488,5 +5488,125 @@ python -c "import comfy_kitchen; import comfy.quant_ops; import comfy.ldm.module
     pip uninstall -y comfy_kitchen 2>/dev/null || true
 }
 
-# Launch ComfyUI listening on all interfaces for RunPod HTTP proxy
-exec python main.py --listen 0.0.0.0 --port 8188 --preview-method auto
+# Pre-stream model files into Linux OS page cache in background
+echo "  -> Pre-warming model files into memory cache..."
+cat "${MODELS_DIR}/text_encoders/qwen_3_8b_fp8mixed.safetensors" > /dev/null 2>&1 &
+cat "${MODELS_DIR}/diffusion_models/flux-2-klein-9b.safetensors" > /dev/null 2>&1 &
+cat "${MODELS_DIR}/vae/flux2-vae.safetensors" > /dev/null 2>&1 &
+cat "${MODELS_DIR}/loras/Alissonerdx__BFS-Best-Face-Swap__bfs_head_v1_flux-klein_9b_step3750_rank64.safetensors" > /dev/null 2>&1 &
+
+# Launch ComfyUI server in background
+python main.py --listen 0.0.0.0 --port 8188 --preview-method auto &
+COMFY_PID=$!
+
+trap 'kill -TERM ${COMFY_PID} 2>/dev/null' TERM INT
+
+# Automated background model preload and CUDA kernel warmup
+(
+    # Wait until ComfyUI is responding to HTTP requests
+    while ! curl -s -f http://127.0.0.1:8188/system_stats > /dev/null 2>&1; do
+        sleep 1
+    done
+    echo "  [WARMUP] ComfyUI server ready. Sending pre-flight warmup to load models into GPU/RAM..."
+    curl -s -X POST http://127.0.0.1:8188/prompt \
+         -H "Content-Type: application/json" \
+         -d @- << 'WARMUP_JSON' > /dev/null 2>&1
+{
+  "prompt": {
+    "1": {
+      "inputs": {
+        "unet_name": "flux-2-klein-9b.safetensors",
+        "weight_dtype": "default"
+      },
+      "class_type": "UNETLoader"
+    },
+    "2": {
+      "inputs": {
+        "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+        "type": "flux2",
+        "device": "default"
+      },
+      "class_type": "CLIPLoader"
+    },
+    "3": {
+      "inputs": {
+        "vae_name": "flux2-vae.safetensors"
+      },
+      "class_type": "VAELoader"
+    },
+    "4": {
+      "inputs": {
+        "lora_name": "Alissonerdx__BFS-Best-Face-Swap__bfs_head_v1_flux-klein_9b_step3750_rank64.safetensors",
+        "strength_model": 1.0,
+        "model": ["1", 0]
+      },
+      "class_type": "LoraLoaderModelOnly"
+    },
+    "5": {
+      "inputs": {
+        "text": "warmup photo of child face",
+        "clip": ["2", 0]
+      },
+      "class_type": "CLIPTextEncode"
+    },
+    "6": {
+      "inputs": {
+        "model": ["4", 0],
+        "positive": ["5", 0],
+        "negative": ["5", 0],
+        "cfg": 1.0
+      },
+      "class_type": "CFGGuider"
+    },
+    "7": {
+      "inputs": {
+        "width": 64,
+        "height": 64,
+        "batch_size": 1
+      },
+      "class_type": "EmptyFlux2LatentImage"
+    },
+    "8": {
+      "inputs": {
+        "steps": 1,
+        "width": 64,
+        "height": 64
+      },
+      "class_type": "Flux2Scheduler"
+    },
+    "9": {
+      "inputs": {
+        "sampler_name": "euler"
+      },
+      "class_type": "KSamplerSelect"
+    },
+    "10": {
+      "inputs": {
+        "noise_seed": 42
+      },
+      "class_type": "RandomNoise"
+    },
+    "11": {
+      "inputs": {
+        "noise": ["10", 0],
+        "guider": ["6", 0],
+        "sampler": ["9", 0],
+        "sigmas": ["8", 0],
+        "latent_image": ["7", 0]
+      },
+      "class_type": "SamplerCustomAdvanced"
+    },
+    "12": {
+      "inputs": {
+        "samples": ["11", 0],
+        "vae": ["3", 0]
+      },
+      "class_type": "VAEDecode"
+    }
+  }
+}
+WARMUP_JSON
+    echo "  [WARMUP] Pre-flight warmup complete! All Tier 2 models are resident in memory."
+) &
+
+wait ${COMFY_PID}
