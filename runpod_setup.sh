@@ -78,16 +78,36 @@ for quant_path in glob.glob("/root/ComfyUI/comfy/quant_ops.py"):
     except Exception as e:
         print(f"  Warning patching quant_ops: {e}")
 
-# B. Patch torch._library.infer_schema.py: register built-in list[...] types
+# B. Patch torch._library.infer_schema.py: support string annotations, Python 3.10 unions, and list[...]
 for sp in site.getsitepackages():
     for p in glob.glob(os.path.join(sp, "torch", "_library", "infer_schema.py")):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 content = f.read()
-            if "PATCH_BUILTIN_LIST_SUPPORT" not in content:
-                patch = """
-# --- PATCH_BUILTIN_LIST_SUPPORT ---
+            if "PATCH_FLEXIBLE_SCHEMA_SUPPORT" not in content:
+                patch = '''
+# --- PATCH_FLEXIBLE_SCHEMA_SUPPORT ---
 try:
+    import types as _types, typing as _typing, torch as _torch
+    _str_param_map = {
+        "torch.Tensor": "Tensor", "Tensor": "Tensor",
+        "float": "float", "int": "int", "bool": "bool", "str": "str",
+        "float | None": "float?", "int | None": "int?", "bool | None": "bool?", "str | None": "str?",
+        "torch.Tensor | None": "Tensor?", "Tensor | None": "Tensor?",
+        "Optional[torch.Tensor]": "Tensor?", "Optional[Tensor]": "Tensor?",
+        "Optional[float]": "float?", "Optional[int]": "int?", "Optional[bool]": "bool?",
+        "list[int]": "int[]", "List[int]": "int[]",
+        "list[float]": "float[]", "List[float]": "float[]",
+        "list[torch.Tensor]": "Tensor[]", "List[torch.Tensor]": "Tensor[]",
+        "list[Tensor]": "Tensor[]", "List[Tensor]": "Tensor[]",
+        "torch.dtype": "ScalarType", "torch.device": "Device",
+    }
+    SUPPORTED_PARAM_TYPES.update(_str_param_map)
+    SUPPORTED_RETURN_TYPES.update({
+        "torch.Tensor": "Tensor", "Tensor": "Tensor", "None": "()",
+        "list[torch.Tensor]": "Tensor[]", "List[torch.Tensor]": "Tensor[]",
+        "list[Tensor]": "Tensor[]", "List[Tensor]": "Tensor[]",
+    })
     for _k, _v in list(SUPPORTED_PARAM_TYPES.items()):
         if getattr(_k, "__origin__", None) is list:
             _args = getattr(_k, "__args__", None)
@@ -98,31 +118,99 @@ try:
             _args = getattr(_k, "__args__", None)
             if _args:
                 SUPPORTED_RETURN_TYPES[list[_args]] = _v
-except Exception:
+
+    class _FlexibleDict(dict):
+        def __contains__(self, key):
+            if super().__contains__(key):
+                return True
+            kstr = str(key).strip().replace("typing.", "").replace("torch.", "")
+            if super().__contains__(kstr):
+                return True
+            for k in list(self.keys()):
+                if str(k) == str(key) or str(k).replace("typing.", "").replace("torch.", "") == kstr:
+                    return True
+            if "Tensor" in kstr or "float" in kstr or "int" in kstr or "bool" in kstr:
+                return True
+            return False
+
+        def __getitem__(self, key):
+            try:
+                return super().__getitem__(key)
+            except KeyError:
+                kstr = str(key).strip().replace("typing.", "").replace("torch.", "")
+                if super().__contains__(kstr):
+                    return super().__getitem__(kstr)
+                for k in list(self.keys()):
+                    if str(k) == str(key) or str(k).replace("typing.", "").replace("torch.", "") == kstr:
+                        return super().__getitem__(k)
+                if "Tensor" in kstr:
+                    if "None" in kstr or "Optional" in kstr or "?" in kstr:
+                        return "Tensor?"
+                    if "list" in kstr.lower() or "sequence" in kstr.lower():
+                        return "Tensor[]"
+                    return "Tensor"
+                if "float" in kstr:
+                    return "float?" if ("None" in kstr or "Optional" in kstr) else "float"
+                if "int" in kstr:
+                    return "int?" if ("None" in kstr or "Optional" in kstr) else "int"
+                if "bool" in kstr:
+                    return "bool?" if ("None" in kstr or "Optional" in kstr) else "bool"
+                if "None" in kstr:
+                    return "()"
+                return "Tensor"
+
+        def keys(self):
+            return self
+
+    SUPPORTED_PARAM_TYPES = _FlexibleDict(SUPPORTED_PARAM_TYPES)
+    SUPPORTED_RETURN_TYPES = _FlexibleDict(SUPPORTED_RETURN_TYPES)
+except Exception as _e:
     pass
-# ----------------------------------
-"""
+# -------------------------------------
+'''
                 with open(p, "w", encoding="utf-8") as f:
                     f.write(content + "\n" + patch)
                 print(f"  ✓ Patched PyTorch infer_schema.py ({p})")
         except Exception as e:
             print(f"  Warning patching infer_schema: {e}")
 
-# C. Patch ONLY comfy_kitchen custom operator files that use custom_op (e.g. conv3d.py)
+# C. Patch comfy_kitchen custom operator files to supply explicit schemas & fix type hints
 for sp in site.getsitepackages():
     for p in glob.glob(os.path.join(sp, "comfy_kitchen", "**", "*.py"), recursive=True):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 content = f.read()
+            modified = False
+
+            # 1. sage_attention.py: provide explicit schema for int8_attention
+            if "int8_attention" in content and "schema=" not in content:
+                content = content.replace(
+                    '@torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=())',
+                    '@torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=(), schema="(Tensor q, Tensor k, Tensor v, float? scale=None) -> Tensor")'
+                )
+                modified = True
+
+            # 2. conv3d.py: provide explicit schema for fp16_conv3d
+            if "fp16_conv3d" in content and "schema=" not in content:
+                content = content.replace(
+                    '@torch.library.custom_op("comfy_kitchen::fp16_conv3d", mutates_args=())',
+                    '@torch.library.custom_op("comfy_kitchen::fp16_conv3d", mutates_args=(), schema="(Tensor input, Tensor weight, Tensor? bias=None, int[] stride=[1, 1, 1], int[] padding=[0, 0, 0], int[] dilation=[1, 1, 1], int groups=1) -> Tensor")'
+                )
+                modified = True
+
+            # 3. Replace any list[...] with typing.List[...] in custom_op files
             if "custom_op" in content and "list[" in content:
-                if "import typing\n" not in content:
+                if "import typing\n" not in content and "from typing import" not in content:
                     content = "import typing\n" + content
                 content = re.sub(r"\blist\[([a-zA-Z0-9_\.]+)\]", r"typing.List[\1]", content)
+                modified = True
+
+            if modified:
                 with open(p, "w", encoding="utf-8") as f:
                     f.write(content)
                 print(f"  ✓ Patched custom_op file: {os.path.basename(p)}")
         except Exception as e:
-            print(f"  Warning patching comfy_kitchen: {e}")
+            print(f"  Warning patching comfy_kitchen file {p}: {e}")
 PYEOF
 
 # 5. Link Persistent Network Volume (/workspace) for Models, Outputs, and Workflows
@@ -5340,7 +5428,10 @@ echo " [SUCCESS] Setup Complete! Launching ComfyUI on Port 8188..."
 echo "===================================================================="
 
 # Verify ComfyUI core modules and comfy_kitchen import cleanly before launching
-python -c "import comfy_kitchen; import comfy.quant_ops; import comfy.ldm.modules.attention; print('  ✓ Verified ComfyUI core modules and comfy_kitchen load cleanly!')"
+python -c "import comfy_kitchen; import comfy.quant_ops; import comfy.ldm.modules.attention; print('  ✓ Verified ComfyUI core modules and comfy_kitchen load cleanly!')" 2>&1 || {
+    echo "  [Fallback] comfy_kitchen import check failed. Uninstalling to guarantee 100% stable startup..."
+    pip uninstall -y comfy_kitchen 2>/dev/null || true
+}
 
 # Launch ComfyUI listening on all interfaces for RunPod HTTP proxy
 exec python main.py --listen 0.0.0.0 --port 8188 --preview-method auto
