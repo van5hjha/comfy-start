@@ -40,10 +40,17 @@ cd "${COMFY_DIR}"
 echo "[3/6] Installing ComfyUI core requirements..."
 pip install -q -r requirements.txt
 
-# Blackwell GPU (sm_120) compatibility: upgrade PyTorch to CUDA 12.8 if needed
-if python -c "import torch; exit(0 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 12 and '12.0' not in torch.cuda.get_arch_list() and 'sm_120' not in torch.cuda.get_arch_list() else 1)" 2>/dev/null; then
-    echo "  [INFO] NVIDIA Blackwell GPU detected (sm_120). Upgrading PyTorch with CUDA 12.8 for native Blackwell kernel support..."
-    pip install -q --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Ensure PyTorch is >= 2.5 for native GQA (Qwen 3 text encoder) and modern kernel support
+if python -c "import torch; exit(0 if tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])) >= (2, 5) else 1)" 2>/dev/null; then
+    echo "  [INFO] PyTorch is already >= 2.5 ($(python -c 'import torch; print(torch.__version__)'))."
+else
+    if python -c "import torch; exit(0 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 12 else 1)" 2>/dev/null; then
+        echo "  [INFO] NVIDIA Blackwell GPU (sm_120) detected. Installing PyTorch with CUDA 12.8..."
+        pip install -q --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+    else
+        echo "  [INFO] Upgrading PyTorch to >= 2.5 with CUDA 12.4 for native GQA and FlashAttention support..."
+        pip install -q --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    fi
 fi
 
 pip install -q --force-reinstall --no-deps comfy-kitchen
@@ -221,6 +228,41 @@ for sp in site.getsitepackages():
                 print(f"  ✓ Patched custom_op file: {os.path.basename(p)}")
         except Exception as e:
             print(f"  Warning patching comfy_kitchen file {p}: {e}")
+
+# D. Patch ComfyUI ops.py: support enable_gqa on all PyTorch versions (< 2.5 fallback)
+for ops_path in glob.glob("/root/ComfyUI/comfy/ops.py"):
+    try:
+        with open(ops_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        if "PATCH_SAFE_SDPA_GQA" not in code:
+            patch = '''
+# --- PATCH_SAFE_SDPA_GQA ---
+try:
+    import torch
+    _orig_torch_sdpa = torch.nn.functional.scaled_dot_product_attention
+    def _safe_sdpa(q, k, v, *args, **kwargs):
+        if "enable_gqa" in kwargs:
+            gqa = kwargs.pop("enable_gqa")
+            try:
+                return _orig_torch_sdpa(q, k, v, *args, enable_gqa=gqa, **kwargs)
+            except TypeError:
+                if k.size(-3) != q.size(-3):
+                    repeats = q.size(-3) // k.size(-3)
+                    k = k.repeat_interleave(repeats, dim=-3)
+                    v = v.repeat_interleave(repeats, dim=-3)
+                return _orig_torch_sdpa(q, k, v, *args, **kwargs)
+        return _orig_torch_sdpa(q, k, v, *args, **kwargs)
+    torch.nn.functional.scaled_dot_product_attention = _safe_sdpa
+except Exception:
+    pass
+# ---------------------------
+'''
+            code = code + "\n" + patch
+            with open(ops_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            print("  ✓ Patched comfy/ops.py for safe GQA attention compatibility")
+    except Exception as e:
+        print(f"  Warning patching ops.py: {e}")
 PYEOF
 
 # 5. Link Persistent Network Volume (/workspace) for Models, Outputs, and Workflows
