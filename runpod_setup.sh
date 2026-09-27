@@ -14,11 +14,12 @@ WORKSPACE="/workspace"
 COMFY_DIR="/root/ComfyUI"
 MODELS_DIR="${WORKSPACE}/models"
 OUTPUTS_DIR="${WORKSPACE}/output"
+INPUTS_DIR="${WORKSPACE}/input"
 WORKFLOWS_DIR="${WORKSPACE}/workflows"
 
 # Clean up any broken leftover ComfyUI directory on NFS volume
 rm -rf "${WORKSPACE}/ComfyUI" 2>/dev/null || true
-mkdir -p "${WORKSPACE}" "${MODELS_DIR}" "${OUTPUTS_DIR}" "${WORKFLOWS_DIR}"
+mkdir -p "${WORKSPACE}" "${MODELS_DIR}" "${OUTPUTS_DIR}" "${INPUTS_DIR}" "${WORKFLOWS_DIR}"
 
 # 1. System packages (aria2 for 10Gbps parallel downloads)
 echo "[1/6] Installing system tools (aria2, git, curl)..."
@@ -59,6 +60,8 @@ fi
 
 echo "  -> Installing custom node dependencies..."
 pip install -q color-matcher mss opencv-python-headless GitPython
+pip install -q -r "${CUSTOM_NODES}/ComfyUI-Manager/requirements.txt" 2>/dev/null || true
+pip install -q -r "${CUSTOM_NODES}/ComfyUI-KJNodes/requirements.txt" 2>/dev/null || true
 
 # Apply PyTorch 2.4 compatibility patches for comfy_kitchen and quant_ops
 echo "  -> Applying PyTorch 2.4 compatibility patches..."
@@ -227,6 +230,9 @@ ln -sf "${MODELS_DIR}" "${COMFY_DIR}/models"
 
 rm -rf "${COMFY_DIR}/output"
 ln -sf "${OUTPUTS_DIR}" "${COMFY_DIR}/output"
+
+rm -rf "${COMFY_DIR}/input"
+ln -sf "${INPUTS_DIR}" "${COMFY_DIR}/input"
 
 mkdir -p "${COMFY_DIR}/user/default"
 rm -rf "${COMFY_DIR}/user/default/workflows"
