@@ -56,6 +56,71 @@ fi
 echo "  -> Installing custom node dependencies..."
 pip install -q color-matcher mss opencv-python-headless GitPython
 
+# Apply PyTorch 2.4 compatibility patches for comfy_kitchen and quant_ops
+echo "  -> Applying PyTorch 2.4 compatibility patches..."
+python - << 'PYEOF'
+import os, sys, glob, site, re
+
+# A. Patch ComfyUI quant_ops.py: catch (ImportError, Exception) so startup never crashes
+for quant_path in glob.glob("/root/ComfyUI/comfy/quant_ops.py"):
+    try:
+        with open(quant_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        if "except (ImportError, Exception) as e:" not in code:
+            code = code.replace("except ImportError as e:", "except (ImportError, Exception) as e:")
+            with open(quant_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            print("  ✓ Patched comfy/quant_ops.py for robust error handling")
+    except Exception as e:
+        print(f"  Warning patching quant_ops: {e}")
+
+# B. Patch torch._library.infer_schema.py: register built-in list[...] types
+for sp in site.getsitepackages():
+    for p in glob.glob(os.path.join(sp, "torch", "_library", "infer_schema.py")):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                content = f.read()
+            if "PATCH_BUILTIN_LIST_SUPPORT" not in content:
+                patch = """
+# --- PATCH_BUILTIN_LIST_SUPPORT ---
+try:
+    for _k, _v in list(SUPPORTED_PARAM_TYPES.items()):
+        if getattr(_k, "__origin__", None) is list:
+            _args = getattr(_k, "__args__", None)
+            if _args:
+                SUPPORTED_PARAM_TYPES[list[_args]] = _v
+    for _k, _v in list(SUPPORTED_RETURN_TYPES.items()):
+        if getattr(_k, "__origin__", None) is list:
+            _args = getattr(_k, "__args__", None)
+            if _args:
+                SUPPORTED_RETURN_TYPES[list[_args]] = _v
+except Exception:
+    pass
+# ----------------------------------
+"""
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(content + "\n" + patch)
+                print(f"  ✓ Patched PyTorch infer_schema.py ({p})")
+        except Exception as e:
+            print(f"  Warning patching infer_schema: {e}")
+
+# C. Patch comfy_kitchen python files: replace list[...] with typing.List[...]
+for sp in site.getsitepackages():
+    for p in glob.glob(os.path.join(sp, "comfy_kitchen", "**", "*.py"), recursive=True):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                content = f.read()
+            if "list[" in content:
+                new_content = re.sub(r"\blist\[([a-zA-Z0-9_\.]+)\]", r"typing.List[\1]", content)
+                if "import typing" not in new_content and "from typing import" not in new_content:
+                    new_content = "import typing\n" + new_content
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                print(f"  ✓ Patched comfy_kitchen file: {os.path.basename(p)}")
+        except Exception as e:
+            print(f"  Warning patching comfy_kitchen: {e}")
+PYEOF
+
 # 5. Link Persistent Network Volume (/workspace) for Models, Outputs, and Workflows
 echo "[5/6] Linking persistent network volume (/workspace) to ComfyUI..."
 mkdir -p "${MODELS_DIR}/text_encoders"
@@ -5269,6 +5334,12 @@ echo "  -> Workflow deployed successfully!"
 echo "===================================================================="
 echo " [SUCCESS] Setup Complete! Launching ComfyUI on Port 8188..."
 echo "===================================================================="
+
+# Verify ComfyUI core modules import cleanly before launching
+python -c "import comfy.quant_ops; print('  ✓ Verified ComfyUI core modules load cleanly!')" 2>&1 || {
+    echo "  [Fallback] Uninstalling comfy_kitchen to guarantee clean startup..."
+    pip uninstall -y comfy_kitchen 2>/dev/null || true
+}
 
 # Launch ComfyUI listening on all interfaces for RunPod HTTP proxy
 exec python main.py --listen 0.0.0.0 --port 8188 --preview-method auto
