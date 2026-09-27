@@ -5602,6 +5602,12 @@ trap 'kill -TERM ${COMFY_PID} 2>/dev/null' TERM INT
         "vae": ["3", 0]
       },
       "class_type": "VAEDecode"
+    },
+    "13": {
+      "inputs": {
+        "images": ["12", 0]
+      },
+      "class_type": "PreviewImage"
     }
   }
 }
